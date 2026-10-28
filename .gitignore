@@ -1,0 +1,8 @@
+# macOS
+.DS_Store
+
+# 本地构建产物
+*.lpk
+
+# 已废弃的 LPK 反代实验(含真实域名与内网地址,不入库)
+lazycat-dsh-relay-build/
