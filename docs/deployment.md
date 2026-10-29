@@ -359,7 +359,92 @@ curl -s -o /dev/null -w "%{size_download}B %{time_total}s\n" \
 
 装完插件后 UI 会出现 `1 change(s) pending restart`,重启 dsh 生效。
 
-## 10. 踩坑记录(实测)
+## 10. 模型 API 连接稳定性(长回复中断)
+
+### 10.1 症状
+
+运行任务时偶发:
+
+```
+本轮运行失败 DeepSeek: connection lost mid-reply
+(read tcp 100.64.0.10:58898->198.18.0.13:443: read: connection reset by peer)
+```
+
+`198.18.0.13` 是该域名在 fake-ip 段里的映射地址(见第 10 章踩坑 14),实际目标是模型 API 的 443 端口。请求链路是:
+
+```
+dsh → 本地模型网关(127.0.0.1:3425) → api.deepseek.com
+```
+
+### 10.2 实测:不是地址问题,是链路间歇故障
+
+用真实 API 做长流(约 200KB / 单次 5 秒)交替对比两条地址路径,各 8 轮:
+
+| 路径 | 成功 | 失败形态 |
+|---|---|---|
+| fake-ip(`198.18.0.x`) | 6/8 | 1 次建连超时、1 次传输中途停滞 |
+| 真实 IP(`--resolve` 指定) | 7/8 | 1 次传输中途停滞 |
+
+**两条路径都失败**,说明问题不在 DNS 或 fake-ip,而在上游链路的时段性中断。失败有两种形态:
+
+1. **建连超时**——SYN 丢失,请求根本没发出去
+2. **传输中途停滞**——已收到部分字节(实测 5KB / 117KB 不等),之后长时间无数据,直到客户端超时
+
+第二种正是用户看到的"connection lost mid-reply":回复进行到一半,连接被静默掐断。
+
+### 10.3 缓解:提高重试韧性
+
+链路问题无法在 VM 内根治(故障在上游代理),因此把重点放在"单次中断不至于让整轮任务失败"。
+
+dsh 的 provider 配置支持 `retryPolicy`,默认 `maxRetries: 5`。实测单次成功率约 75–87%,按 10 次重试计算累积成功率可达 99.9999%,足以覆盖当前故障率。
+
+编辑 `$DSH_HOME/profiles/web/cordis.patch.yml`,在该 provider 段内加:
+
+```yaml
+        retryPolicy:
+          mode: normal
+          maxRetries: 10
+          backoff:
+            initialDelayMs: 1000
+            maxDelayMs: 10000
+            jitterRatio: 0.2
+```
+
+`retryableCodes` 用默认值即可(`EMPTY_RESPONSE` / `RATE_LIMIT` / `SERVER` / `TIMEOUT` / `TRANSPORT`),其中 `TRANSPORT` 与 `TIMEOUT` 正好覆盖连接重置和停滞。
+
+配套调快 TCP 僵死连接的探测(默认 2 小时才探测,等于不起作用):
+
+```sh
+sudo tee /etc/sysctl.d/90-dsh-keepalive.conf >/dev/null <<'EOF'
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 4
+EOF
+sudo sysctl -p /etc/sysctl.d/90-dsh-keepalive.conf
+```
+
+改完重启:
+
+```sh
+sudo systemctl restart dsh
+```
+
+### 10.4 验证配置真的生效
+
+不要只看服务是不是 active——配置写错 schema 会被拒绝但服务仍可能起来。用合成的运行时配置确认:
+
+```sh
+dsh --profile web --dump-config | grep -A6 "maxRetries: 10"
+# 期望看到 retryPolicy / maxRetries: 10 / backoff 三项
+```
+
+端到端验证:在 UI 发一条消息,回复能正常流式输出并显示完成。实测一次 11 秒完成、90 tok/s。
+
+### 10.5 残余风险
+
+如果某段时间上游链路连续故障,10 次重试仍可能全部落在坏窗口内,任务会失败——这时**直接重试一次**通常就恢复了。若发现失败率显著上升,再考虑在代理侧为实例流量做规则隔离或更换出口。
+
+## 11. 踩坑记录(实测)
 
 1. **npm 11 拦截原生模块安装脚本**:`node-pty`/`koffi` 的 postinstall 被默认拦截,安装"成功"但 shell 工具损坏,必须先配 `allow-scripts`(见 3.2)
 2. **npmmirror 对 rc 版本同步延迟**:报 `ETARGET` 时加 `--prefer-online` 或换官方源
@@ -376,12 +461,15 @@ curl -s -o /dev/null -w "%{size_download}B %{time_total}s\n" \
 13. **CLI 安装与 Web UI 安装走不同网络路径**:`dsh plugin add` 走 pnpm/npm,Web UI 走 dshmarket catalog。前者成功不能证明后者没问题,反之亦然。排错时必须分开验证
 14. **DNS 返回 `198.18.0.x` 是 DNS 层的 fake-ip 注入**:这是上游 Clash TUN 的 fake-ip 段(平台 Clash 声明 `198.18.0.1/30`,VM 却拿到 .11/.25/.39,已越界)。实测它与真实 IP 的 TCP 可达性无差别(各 8/8),**不是插件安装失败的主因**;真正的瓶颈是长连接传输的时段性停滞。看到这个地址不必惊慌,但值得用 `--resolve` 强制真实 IP 做对照
 15. **`ping` 不可用作这台机器的连通性判据**:平台对 ICMP 有限速/过滤,实测网关丢包率可达 40%、公网 100%,但同一时刻 TCP 443 全部可达。用 TCP 而非 ICMP 判断网络健康
+16. **长回复中断是链路间歇故障,不是 DNS 或 fake-ip 引起**:用真实 IP 与 fake-ip 各跑 8 轮长流,两者都有失败(7/8 与 6/8)。修复方向是提高重试而非换地址,详见第 10 章
+17. **改完配置要看合成后的运行时配置**:`systemctl is-active` 只说明进程活着。用 `dsh --profile web --dump-config` 确认改动真的进了配置树,否则可能 schema 报错被静默忽略
 
-## 11. 后续规划
+## 12. 后续规划
 
 - [x] **WebSocket 透传**——已解决。平台 HTTP 服务转发保留 Upgrade 头,nginx 前置层负责 Host 对齐与 WS 升级,实测握手 101
 - [x] **插件市场抓取失败**——已解决。根因是默认 region 指向的国内镜像源不可用,切到 global 后正常(见第 9 节)
 - [x] **插件可安装**——已验证 `dsh-better-sidebar`、`dsh-whale-widget`、`dsh-context`、`dsh-remote` 均可用,Web UI 与 CLI 两条路径都能装
+- [x] **长回复中断**——已缓解。链路间歇故障无法在 VM 内根治,改为 provider 级 `maxRetries: 10` + TCP keepalive 提速(见第 10 章),端到端验证通过
 - [ ] 模型 API key 配置与消费上限设置(当前 `/etc/dsh.env` 仍是占位符,也可在网页 **设置 → 模型** 里配)
 - [ ] preset 能力分级落地(NAS 默认 `minimal`)
 - [ ] 可选加固:VM 内 nftables 阻断到 RFC1918 内网的出栈(防提示注入后的横向移动;注意与 NAS 存储挂载通道的兼容性——virtiofs/9p 走 hypervisor 通道不受影响,SMB/NFS 走网络需为 NAS IP 加白)。**注意**:在 NAT 模式下 dsh 绑 loopback、外部入口只有平台代理,出栈加固的边际收益有限,优先级低于前两项
